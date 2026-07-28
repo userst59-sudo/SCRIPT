@@ -9,8 +9,9 @@
 #  [1] Panel      - Docker Panel + MariaDB + Redis, only local port 3000
 #  [2] Wings      - QDNA node + Wings systemd service, only local port 8080
 #  [3] Cloudflare - cloudflared + Tunnel connector token, separate operation
-#  [4] Theme      - built-in SpacyCloud skin / CSS URL / full React overlay
-#  [5] Status     - non-destructive diagnostics
+#  [4] Theme      - reserved professional Theme Installer (Coming Soon)
+#  [5] Status     - non-destructive service/endpoints diagnostics
+#  [6] VPS        - local QEMU/KVM cloud-image VPS manager
 #
 # NEVER commit the generated /opt/spacycloud-panel/.env or a Cloudflare token.
 # ==============================================================================
@@ -27,10 +28,12 @@ readonly PANEL_ENV="$INSTALL_ROOT/.env"
 readonly WINGS_CONFIG='/etc/pterodactyl/config.yml'
 readonly STATE_DIR='/etc/spacycloud'
 readonly STATE_FILE="$STATE_DIR/installer.env"
+readonly VM_ROOT='/var/lib/spacycloud-vms'
+readonly VM_CONFIG_DIR='/etc/spacycloud/vms'
+readonly VM_RUNNER='/usr/local/sbin/spacycloud-vm-runner'
+readonly VM_SERVICE_TEMPLATE='/etc/systemd/system/spacycloud-vm@.service'
 readonly LOG_FILE='/var/log/spacycloud-installer.log'
 readonly STOCK_PANEL_IMAGE="ghcr.io/pterodactyl/panel:${PANEL_VERSION}"
-readonly SPACYCLOUD_PANEL_IMAGE="spacycloud/pterodactyl-panel:${PANEL_VERSION}-spacycloud"
-readonly OVERLAY_PANEL_IMAGE="spacycloud/pterodactyl-panel:${PANEL_VERSION}-custom"
 
 # State-only values: no password, database secret, application key, or CF token.
 PANEL_DOMAIN=''
@@ -71,6 +74,7 @@ The menu provides independent operations:
   3) Install | Cloudflare Tunnel connector
   4) Install | Theme
   5) View health/status
+  6) Create/manage local QEMU/KVM VPS
 
 Options:
   --panel       Open only the Panel submenu.
@@ -78,6 +82,7 @@ Options:
   --cloudflare  Run only Cloudflare connector setup.
   --theme       Open only the theme installer.
   --status      Show diagnostics only.
+  --vps         Open only the local QEMU/KVM VPS Manager.
   --help        Show this help.
 
 For a normal first installation use the menu in this order:
@@ -526,18 +531,29 @@ update_panel() {
 
 panel_create_user() {
     line
-    printf '%b%s%b\n' "$C_BOLD" '  PANEL USER CREATOR' "$C_RESET"
+    printf '%b%s%b\n' "$C_BOLD" '  [3] PANEL USER MANAGEMENT' "$C_RESET"
     line
     require_panel
-    local email username password admin_choice admin_flag
+    cat <<'EOF'
+  [1] Create normal Panel user
+  [2] Create Panel administrator
+  [0] Back
+EOF
+    local user_type email username password admin_flag
+    read -r -p 'Select user type: ' user_type
+    case "$user_type" in
+        1) admin_flag=0 ;;
+        2) admin_flag=1 ;;
+        0|'') return 0 ;;
+        *) warn 'Invalid user type.'; return 0 ;;
+    esac
+
     prompt_required email 'User email'
     [[ "$email" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]] || die 'User email is invalid.'
     prompt username 'Username' 'user'
     validate_username "$username"
     prompt_secret password 'User password (minimum 12 characters)'
     validate_password "$password"
-    read -r -p 'Make this user a Panel administrator? [y/N]: ' admin_choice
-    [[ "${admin_choice,,}" == 'y' || "${admin_choice,,}" == 'yes' ]] && admin_flag=1 || admin_flag=0
     confirm "Create ${username} (${email})?" || { unset password; return 0; }
     create_panel_user "$email" "$username" "$password" "$admin_flag"
     unset password
@@ -573,19 +589,32 @@ panel_change_domain() {
 }
 
 panel_menu() {
+    local choice image panel_state state_color
     while true; do
+        load_state
+        if panel_exists; then
+            image=$(get_panel_image)
+            panel_state='INSTALLED'
+            state_color="$C_GREEN"
+        else
+            image='—'
+            panel_state='NOT INSTALLED'
+            state_color="$C_YELLOW"
+        fi
         line
         printf '%b%s%b\n' "$C_BOLD" '  [1] INSTALL | PANEL' "$C_RESET"
         line
+        printf '  Status : %b%s%b\n' "$state_color" "$panel_state" "$C_RESET"
+        printf '  Domain : %s\n' "${PANEL_DOMAIN:-not configured}"
+        printf '  Image  : %s\n\n' "$image"
         cat <<'EOF'
   [1] Install / Repair Panel
-  [2] Update Panel — list official versions
-  [3] Create Panel user / administrator
+  [2] Update Panel — show official Pterodactyl versions
+  [3] Create users — normal user or administrator
   [4] Change Panel domain
   [5] Panel status
   [0] Back
 EOF
-        local choice
         read -r -p 'Select Panel option: ' choice
         case "$choice" in
             1) install_panel ;;
@@ -797,181 +826,56 @@ install_cloudflared_package() {
 }
 
 configure_cloudflare() {
+    # Deliberately minimal by request: option 3 installs cloudflared when absent,
+    # accepts one connector-token paste, and connects. Hostnames/routes are not
+    # prompted for or modified here; they remain configured in Cloudflare.
     require_systemd
     line
-    printf '%b%s%b\n' "$C_BOLD" '  [3] CLOUDFLARE TUNNEL CONNECTOR' "$C_RESET"
+    printf '%b%s%b\n' "$C_BOLD" '  [3] INSTALL | CLOUDFLARE TUNNEL' "$C_RESET"
     line
-    load_state
     install_cloudflared_package
 
-    prompt_required PANEL_DOMAIN 'Panel hostname routed through Cloudflare'
-    prompt_required WINGS_DOMAIN 'Wings hostname routed through Cloudflare'
-    PANEL_DOMAIN="${PANEL_DOMAIN,,}"; WINGS_DOMAIN="${WINGS_DOMAIN,,}"
-    validate_domain "$PANEL_DOMAIN" 'Panel domain'
-    validate_domain "$WINGS_DOMAIN" 'Wings domain'
-
-    cat <<EOF
-
-Configure these Public Hostnames in Cloudflare Zero Trust BEFORE continuing:
-  ${PANEL_DOMAIN}  -> HTTP -> http://localhost:3000
-  ${WINGS_DOMAIN}  -> HTTP -> http://localhost:8080
-
-Paste only the long connector token, not the entire 'cloudflared service install ...' command.
-EOF
     local CF_TUNNEL_TOKEN
     prompt_cloudflare_token_visible
-    confirm 'Install this connector token as the cloudflared system service?' || { unset CF_TUNNEL_TOKEN; return 0; }
+    say 'Connecting cloudflared to the supplied Tunnel token...'
 
+    # A connector service can only hold one token. Replace it automatically so
+    # this option remains a single paste-and-connect action as requested.
     if systemctl is-active --quiet cloudflared || systemctl is-enabled --quiet cloudflared 2>/dev/null; then
-        warn 'An existing cloudflared service was found.'
-        confirm 'Replace the existing cloudflared service on this VPS?' || { unset CF_TUNNEL_TOKEN; return 0; }
-        cloudflared service uninstall || true
+        systemctl disable --now cloudflared >/dev/null 2>&1 || true
+        cloudflared service uninstall >/dev/null 2>&1 || true
     fi
 
-    # cloudflared performs the final online token validation and creates a
-    # root-owned systemd service. A structurally-valid token can still be stale,
-    # revoked, or from a deleted tunnel, so handle that cleanly and return to menu.
+    # cloudflared performs final online validation and creates its root-owned
+    # systemd service. It does not create/alter Cloudflare Public Hostnames.
     if ! cloudflared service install "$CF_TUNNEL_TOKEN"; then
         unset CF_TUNNEL_TOKEN
         warn 'Cloudflare rejected this connector token. Generate a fresh token from the active tunnel and paste it again.'
-        warn 'Do not reuse the token that was pasted into chat or exposed on screen.'
+        warn 'Do not reuse a token already exposed in chat or on screen.'
         return 0
     fi
     unset CF_TUNNEL_TOKEN
     systemctl daemon-reload
     systemctl enable --now cloudflared
-    sleep 3
+    sleep 2
     systemctl is-active --quiet cloudflared || { journalctl -u cloudflared --no-pager -n 100; die 'cloudflared service did not start.'; }
-    save_state
-    ok 'Cloudflare Tunnel connector is active.'
-
-    local panel_http wings_http
-    panel_http=$(curl -ksS -o /dev/null -w '%{http_code}' --connect-timeout 6 --max-time 12 "https://${PANEL_DOMAIN}/" || true)
-    wings_http=$(curl -ksS -o /dev/null -w '%{http_code}' --connect-timeout 6 --max-time 12 "https://${WINGS_DOMAIN}/" || true)
-    [[ "$panel_http" == '200' ]] && ok 'Panel public endpoint: HTTP 200.' \
-        || warn "Panel public endpoint: ${panel_http:-no response}. Check the Public Hostname mapping to localhost:3000."
-    [[ "$wings_http" == '401' ]] && ok 'Wings public endpoint: HTTP 401 (healthy expected result).' \
-        || warn "Wings public endpoint: ${wings_http:-no response}. Check the Public Hostname mapping to localhost:8080."
-}
-
-write_css_theme_dockerfile() {
-    local css_source="$1"
-    install -d -m 0750 "$INSTALL_ROOT/theme/public/themes/spacycloud"
-    if [[ "$css_source" == 'builtin' ]]; then
-        cat > "$INSTALL_ROOT/theme/public/themes/spacycloud/spacycloud.css" <<'EOF'
-:root { --spacy-cyan:#38d8ff; --spacy-indigo:#6e7dff; --spacy-bg:#080d1b; --spacy-card:#101a32; }
-html,body { background:var(--spacy-bg)!important; }
-body { background-image:radial-gradient(circle at 8% -20%,rgba(56,216,255,.15),transparent 32rem),radial-gradient(circle at 95% 0,rgba(103,116,255,.12),transparent 28rem)!important; }
-#NavigationBar { border-bottom:1px solid rgba(123,183,255,.16)!important; background:rgba(8,13,27,.9)!important; backdrop-filter:blur(16px); }
-#NavigationBar #logo a { letter-spacing:.025em; background:linear-gradient(100deg,#fff,#8ce9ff); -webkit-background-clip:text; -webkit-text-fill-color:transparent; }
-#NavigationBar #logo a::after { content:'SPACYCLOUD'; display:block; font:600 8px/1 sans-serif; letter-spacing:.22em; -webkit-text-fill-color:#38d8ff; margin-top:3px; }
-.bg-neutral-700,.bg-neutral-800,.bg-neutral-900 { background-color:var(--spacy-card)!important; }
-.rounded { border-color:rgba(145,193,255,.12)!important; }
-button.bg-primary-500,.bg-primary-500 { background:linear-gradient(110deg,var(--spacy-cyan),var(--spacy-indigo))!important; color:#07101f!important; font-weight:700!important; }
-input,select,textarea { border-color:rgba(111,178,255,.24)!important; background-color:#0c1428!important; }
-::-webkit-scrollbar { width:10px;height:10px; } ::-webkit-scrollbar-thumb { background:#26385f;border-radius:999px; } ::-webkit-scrollbar-track { background:#0a1020; }
-EOF
-    else
-        curl -fL --proto '=https' --tlsv1.2 --retry 3 --connect-timeout 15 "$css_source" \
-            -o "$INSTALL_ROOT/theme/public/themes/spacycloud/spacycloud.css"
-        [[ -s "$INSTALL_ROOT/theme/public/themes/spacycloud/spacycloud.css" ]] || die 'Downloaded CSS theme is empty.'
-    fi
-
-    # Fixed root-relative CSS URL avoids Blade quoting/escaping issues in Docker RUN.
-    cat > "$INSTALL_ROOT/theme/Dockerfile" <<EOF
-FROM ${STOCK_PANEL_IMAGE}
-USER root
-COPY public/themes/spacycloud /app/public/themes/spacycloud
-EOF
-    cat >> "$INSTALL_ROOT/theme/Dockerfile" <<'EOF'
-RUN sed -i 's|</head>|<link rel="stylesheet" href="/themes/spacycloud/spacycloud.css?v=1"></head>|' /app/resources/views/templates/wrapper.blade.php
-EOF
-}
-
-activate_local_panel_image() {
-    local image="$1"
-    docker image inspect "$image" >/dev/null 2>&1 || die "Local image does not exist: ${image}"
-    set_panel_image "$image"
-    # Do NOT call compose pull panel here: this image is intentionally local.
-    docker compose -f "$COMPOSE_FILE" pull database cache
-    docker compose -f "$COMPOSE_FILE" up -d --no-deps --force-recreate panel
-    wait_http 'http://127.0.0.1:3000/' 'Themed Panel local origin' 60 \
-        || { docker compose -f "$COMPOSE_FILE" logs --tail=120 panel; die 'Themed Panel did not become healthy.'; }
-}
-
-install_css_theme() {
-    local source="$1"
-    say 'Building the local SpacyCloud CSS theme image...'
-    write_css_theme_dockerfile "$source"
-    docker build -t "$SPACYCLOUD_PANEL_IMAGE" "$INSTALL_ROOT/theme"
-    activate_local_panel_image "$SPACYCLOUD_PANEL_IMAGE"
-    ok 'SpacyCloud CSS skin is active.'
-}
-
-install_overlay_theme() {
-    local url tmp archive
-    read -r -p 'Public HTTPS URL of your full theme overlay .tar.gz: ' url
-    [[ "$url" =~ ^https:// ]] || die 'Use a public HTTPS URL to a .tar.gz theme overlay.'
-    confirm 'Download, compile, and activate this full theme overlay?' || return 0
-
-    install -d -m 0750 "$INSTALL_ROOT/theme"
-    tmp=$(mktemp)
-    curl -fL --proto '=https' --tlsv1.2 --retry 3 --connect-timeout 20 "$url" -o "$tmp"
-    tar -tzf "$tmp" >/dev/null || die 'Theme download is not a valid gzip tar archive.'
-    archive="$INSTALL_ROOT/theme/theme-overlay.tar.gz"
-    mv "$tmp" "$archive"
-    curl -fL --proto '=https' --tlsv1.2 --retry 3 --connect-timeout 20 \
-        "https://github.com/pterodactyl/panel/releases/download/${PANEL_VERSION}/panel.tar.gz" \
-        -o "$INSTALL_ROOT/theme/panel.tar.gz"
-
-    cat > "$INSTALL_ROOT/theme/Dockerfile.overlay" <<EOF
-FROM node:22-alpine AS builder
-RUN apk add --no-cache tar python3 make g++
-WORKDIR /app
-COPY panel.tar.gz /tmp/panel.tar.gz
-RUN tar -xzf /tmp/panel.tar.gz -C /app
-COPY theme-overlay.tar.gz /tmp/theme-overlay.tar.gz
-RUN tar -xzf /tmp/theme-overlay.tar.gz -C /app && mkdir -p /app/public/themes
-RUN yarn install --frozen-lockfile
-RUN NODE_OPTIONS='--max-old-space-size=1536 --openssl-legacy-provider' yarn build:production
-
-FROM ${STOCK_PANEL_IMAGE}
-COPY --from=builder /app/public/assets /app/public/assets
-COPY --from=builder /app/public/themes /app/public/themes
-COPY --from=builder /app/resources/views/templates/wrapper.blade.php /app/resources/views/templates/wrapper.blade.php
-COPY --from=builder /app/resources/views/layouts/admin.blade.php /app/resources/views/layouts/admin.blade.php
-EOF
-    say 'Building full React theme image. This can use substantial CPU/RAM and take several minutes...'
-    docker build -f "$INSTALL_ROOT/theme/Dockerfile.overlay" -t "$OVERLAY_PANEL_IMAGE" "$INSTALL_ROOT/theme"
-    activate_local_panel_image "$OVERLAY_PANEL_IMAGE"
-    ok 'Full custom overlay theme is active.'
+    ok 'Cloudflare Tunnel connector is installed and connected.'
 }
 
 theme_menu() {
+    # Reserved in this release: no bundled or third-party theme is installed.
     line
-    printf '%b%s%b\n' "$C_BOLD" '  [4] THEME INSTALLER' "$C_RESET"
+    printf '%b%s%b\n' "$C_BOLD" '  [4] INSTALL | THEME' "$C_RESET"
     line
-    require_panel
-    ensure_docker
     cat <<'EOF'
-1) Built-in SpacyCloud premium CSS skin
-2) Install a custom CSS theme from a public HTTPS URL
-3) Install your full React/Pterodactyl overlay (.tar.gz URL)
-0) Back
+
+                    ✦  COMING SOON  ✦
+
+  The SpacyCloud Theme Installer is being prepared.
+  No bundled, leaked, or third-party theme is installed by this script.
+
+  Your existing Panel remains unchanged.
 EOF
-    local choice css_url
-    read -r -p 'Select theme option: ' choice
-    case "$choice" in
-        1) confirm 'Build and activate the built-in SpacyCloud skin?' && install_css_theme builtin ;;
-        2)
-            read -r -p 'Public HTTPS URL of the CSS file: ' css_url
-            [[ "$css_url" =~ ^https:// ]] || die 'Use a public HTTPS URL.'
-            confirm 'Download, build, and activate this CSS theme?' && install_css_theme "$css_url"
-            ;;
-        3) install_overlay_theme ;;
-        0|'') return 0 ;;
-        *) warn 'Invalid theme selection.' ;;
-    esac
 }
 
 show_status() {
@@ -1010,6 +914,488 @@ show_status() {
     echo "Logs: ${LOG_FILE}"
 }
 
+# ==============================================================================
+# Local VPS Manager — QEMU/KVM cloud-image virtual machines
+# ==============================================================================
+
+vm_config_path() { printf '%s/%s.env' "$VM_CONFIG_DIR" "$1"; }
+vm_disk_path() { printf '%s/%s/disk.qcow2' "$VM_ROOT" "$1"; }
+vm_seed_path() { printf '%s/%s/seed.iso' "$VM_ROOT" "$1"; }
+
+vm_validate_name() {
+    [[ "$1" =~ ^[a-zA-Z0-9][a-zA-Z0-9-]{0,30}$ ]] \
+        || die 'VM name must use 1-31 letters, numbers, or hyphens and begin with a letter/number.'
+}
+
+vm_validate_hostname() {
+    [[ "$1" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]] \
+        || die 'VM hostname must be a valid single DNS label.'
+}
+
+vm_validate_username() {
+    [[ "$1" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || die 'VM username must be lowercase and use letters, digits, underscore, or hyphen.'
+}
+
+vm_validate_port() {
+    validate_number "$1" "$2" 1
+    [[ "$1" -le 65535 ]] || die "$2 must be 65535 or lower."
+}
+
+vm_port_is_free() {
+    local port="$1"
+    ! lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1
+}
+
+vm_require_dependencies() {
+    require_systemd
+    [[ "$(dpkg --print-architecture)" == 'amd64' ]] \
+        || die 'The VPS Manager currently supports amd64 hosts because its official cloud images are amd64.'
+
+    say 'Checking QEMU/KVM and cloud-image dependencies...'
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y
+    # Includes the exact requested packages plus qemu-utils for qemu-img.
+    apt-get install -y qemu-system qemu-utils cloud-image-utils wget lsof
+
+    install -d -m 0700 "$VM_CONFIG_DIR"
+    install -d -m 0755 "$VM_ROOT/images"
+    vm_write_runner
+    vm_write_service_template
+
+    if [[ -e /dev/kvm ]]; then
+        ok 'KVM acceleration is available.'
+    else
+        warn 'KVM acceleration is unavailable. VMs will use slow software emulation (TCG). Enable nested virtualization/KVM for normal performance.'
+    fi
+}
+
+vm_write_runner() {
+    cat > "$VM_RUNNER" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+name="${1:?VM name is required}"
+[[ "$name" =~ ^[a-zA-Z0-9][a-zA-Z0-9-]{0,30}$ ]] || exit 2
+config="/etc/spacycloud/vms/${name}.env"
+root="/var/lib/spacycloud-vms/${name}"
+[[ -r "$config" && -f "$root/disk.qcow2" && -f "$root/seed.iso" ]] || exit 3
+# Configs are generated root-only by SpacyCloud VPS Manager.
+# shellcheck disable=SC1090
+. "$config"
+
+if [[ -e /dev/kvm ]]; then
+    accel_args=(-accel kvm -cpu host)
+else
+    accel_args=(-accel tcg -cpu max)
+fi
+
+exec /usr/bin/qemu-system-x86_64 \
+    -name "$VM_NAME" \
+    "${accel_args[@]}" \
+    -machine q35 \
+    -m "${VM_RAM_MB}M" \
+    -smp "$VM_CPU" \
+    -drive "file=${root}/disk.qcow2,if=virtio,format=qcow2,cache=none" \
+    -drive "file=${root}/seed.iso,if=virtio,format=raw,readonly=on" \
+    -nic "user,model=virtio-net-pci,hostfwd=tcp::${VM_SSH_PORT}-:22,hostfwd=tcp::${VM_APP_PORT}-:8080" \
+    -display none \
+    -serial mon:stdio \
+    -no-reboot
+EOF
+    chmod 0755 "$VM_RUNNER"
+}
+
+vm_write_service_template() {
+    cat > "$VM_SERVICE_TEMPLATE" <<'EOF'
+[Unit]
+Description=SpacyCloud local VPS (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/spacycloud-vm-runner %i
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+KillSignal=SIGTERM
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+}
+
+vm_load_config() {
+    local name="$1" config
+    vm_validate_name "$name"
+    config=$(vm_config_path "$name")
+    [[ -r "$config" ]] || die "VM '${name}' does not exist."
+    # Config files are generated by vm_write_config and root-only.
+    # shellcheck disable=SC1090
+    . "$config"
+}
+
+vm_write_config() {
+    local config
+    config=$(vm_config_path "$VM_NAME")
+    umask 077
+    {
+        printf 'VM_NAME=%q\n' "$VM_NAME"
+        printf 'VM_OS_LABEL=%q\n' "$VM_OS_LABEL"
+        printf 'VM_IMAGE_URL=%q\n' "$VM_IMAGE_URL"
+        printf 'VM_HOSTNAME=%q\n' "$VM_HOSTNAME"
+        printf 'VM_USERNAME=%q\n' "$VM_USERNAME"
+        printf 'VM_RAM_MB=%q\n' "$VM_RAM_MB"
+        printf 'VM_CPU=%q\n' "$VM_CPU"
+        printf 'VM_DISK_GB=%q\n' "$VM_DISK_GB"
+        printf 'VM_SSH_PORT=%q\n' "$VM_SSH_PORT"
+        printf 'VM_APP_PORT=%q\n' "$VM_APP_PORT"
+    } > "$config"
+    chmod 600 "$config"
+}
+
+vm_write_cloud_init() {
+    local password="$1" vm_dir password_hash
+    vm_dir="$VM_ROOT/$VM_NAME"
+    password_hash=$(printf '%s' "$password" | openssl passwd -6 -stdin)
+    umask 077
+    cat > "$vm_dir/user-data" <<EOF
+#cloud-config
+hostname: ${VM_HOSTNAME}
+manage_etc_hosts: true
+users:
+  - name: ${VM_USERNAME}
+    groups: [sudo]
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    shell: /bin/bash
+    lock_passwd: false
+    passwd: ${password_hash}
+ssh_pwauth: true
+package_update: true
+packages:
+  - qemu-guest-agent
+EOF
+    cat > "$vm_dir/meta-data" <<EOF
+instance-id: spacycloud-${VM_NAME}
+local-hostname: ${VM_HOSTNAME}
+EOF
+    cloud-localds "$vm_dir/seed.iso" "$vm_dir/user-data" "$vm_dir/meta-data"
+    chmod 600 "$vm_dir/user-data" "$vm_dir/meta-data" "$vm_dir/seed.iso"
+    unset password password_hash
+}
+
+vm_select_os() {
+    line
+    printf '%b%s%b\n' "$C_BOLD" '  VPS OPERATING SYSTEM CATALOGUE' "$C_RESET"
+    line
+    cat <<'EOF'
+  [1] Ubuntu Server 20.04 LTS — Focal Fossa
+  [2] Ubuntu Server 22.04 LTS — Jammy Jellyfish
+  [3] Ubuntu Server 24.04 LTS — Noble Numbat
+  [4] Ubuntu Server 26.04 LTS — Resolute Raccoon
+  [5] Debian 11 — Bullseye
+  [6] Debian 12 — Bookworm
+  [7] Debian 13 — Trixie
+  [0] Cancel
+EOF
+    local choice
+    read -r -p 'Select operating system: ' choice
+    case "$choice" in
+        1)
+            VM_OS_LABEL='Ubuntu 20.04 LTS (Focal)'
+            VM_IMAGE_URL='https://cloud-images.ubuntu.com/focal/current/focal-server-cloudimg-amd64.img'
+            ;;
+        2)
+            VM_OS_LABEL='Ubuntu 22.04 LTS (Jammy)'
+            VM_IMAGE_URL='https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img'
+            ;;
+        3)
+            VM_OS_LABEL='Ubuntu 24.04 LTS (Noble)'
+            VM_IMAGE_URL='https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img'
+            ;;
+        4)
+            VM_OS_LABEL='Ubuntu 26.04 LTS (Resolute)'
+            VM_IMAGE_URL='https://cloud-images.ubuntu.com/resolute/current/resolute-server-cloudimg-amd64.img'
+            ;;
+        5)
+            VM_OS_LABEL='Debian 11 (Bullseye)'
+            VM_IMAGE_URL='https://cloud.debian.org/images/cloud/bullseye/latest/debian-11-genericcloud-amd64.qcow2'
+            ;;
+        6)
+            VM_OS_LABEL='Debian 12 (Bookworm)'
+            VM_IMAGE_URL='https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2'
+            ;;
+        7)
+            VM_OS_LABEL='Debian 13 (Trixie)'
+            VM_IMAGE_URL='https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2'
+            ;;
+        0|'') return 1 ;;
+        *) warn 'Invalid operating-system selection.'; return 1 ;;
+    esac
+    return 0
+}
+
+vm_download_base_image() {
+    local filename base part
+    filename=$(basename "${VM_IMAGE_URL%%\?*}")
+    base="$VM_ROOT/images/$filename"
+    if [[ -s "$base" ]]; then
+        qemu-img info "$base" >/dev/null 2>&1 || die "Cached image is invalid: ${base}"
+        ok "Using cached base image: ${filename}"
+    else
+        part="${base}.part"
+        say "Downloading official cloud image: ${VM_OS_LABEL}"
+        rm -f "$part"
+        wget --https-only --show-progress --timeout=30 --tries=3 -O "$part" "$VM_IMAGE_URL"
+        qemu-img info "$part" >/dev/null 2>&1 || die 'Downloaded cloud image is invalid.'
+        mv "$part" "$base"
+        chmod 644 "$base"
+        ok 'Base cloud image downloaded and verified by qemu-img.'
+    fi
+    VM_BASE_IMAGE="$base"
+}
+
+vm_prompt_free_port() {
+    # variable, label, default
+    local variable="$1" label="$2" default="$3"
+    while true; do
+        prompt "$variable" "$label" "$default"
+        vm_validate_port "${!variable}" "$label"
+        if vm_port_is_free "${!variable}"; then
+            return 0
+        fi
+        warn "Host TCP port ${!variable} is already in use. Choose another port."
+        default="${!variable}"
+    done
+}
+
+vm_create() {
+    line
+    printf '%b%s%b\n' "$C_BOLD" '  CREATE LOCAL VPS' "$C_RESET"
+    line
+    vm_require_dependencies
+    vm_select_os || return 0
+
+    local VM_PASSWORD available_ram free_gb
+    prompt VM_NAME 'VM name (example: web01)' 'vps01'
+    vm_validate_name "$VM_NAME"
+    [[ ! -e "$(vm_config_path "$VM_NAME")" ]] || die "VM '${VM_NAME}' already exists. Use Manage VPS instead."
+    prompt VM_HOSTNAME 'Guest hostname' "$VM_NAME"
+    vm_validate_hostname "$VM_HOSTNAME"
+    prompt VM_USERNAME 'Guest username' 'spacy'
+    vm_validate_username "$VM_USERNAME"
+    prompt_secret VM_PASSWORD 'Guest password (minimum 12 characters)'
+    validate_password "$VM_PASSWORD"
+    prompt VM_RAM_MB 'RAM in MB' '2048'
+    validate_number "$VM_RAM_MB" 'RAM' 512
+    prompt VM_CPU 'CPU cores' '2'
+    validate_number "$VM_CPU" 'CPU cores' 1
+    prompt VM_DISK_GB 'Virtual disk in GB' '20'
+    validate_number "$VM_DISK_GB" 'Virtual disk' 8
+    vm_prompt_free_port VM_SSH_PORT 'Host SSH port' '2220'
+    vm_prompt_free_port VM_APP_PORT 'Host web/application port (guest :8080)' '8080'
+    [[ "$VM_SSH_PORT" != "$VM_APP_PORT" ]] || die 'SSH and application host ports must be different.'
+
+    available_ram=$(awk '/MemAvailable/ {print int($2/1024)}' /proc/meminfo)
+    free_gb=$(df -BG "$VM_ROOT" | awk 'NR==2 {gsub(/G/, "", $4); print $4}')
+    if (( VM_RAM_MB > available_ram - 384 )); then
+        warn "Requested ${VM_RAM_MB} MB leaves little host RAM (currently ${available_ram} MB available). The VM may cause the host to run out of memory."
+    fi
+    if (( VM_DISK_GB > free_gb )); then
+        warn "Virtual disk is ${VM_DISK_GB} GB but host free disk is ${free_gb} GB. The qcow2 disk starts sparse, but it can fill the host later."
+    fi
+
+    cat <<EOF
+
+Selected VPS:
+  OS:       ${VM_OS_LABEL}
+  Hostname: ${VM_HOSTNAME}
+  Username: ${VM_USERNAME}
+  RAM:      ${VM_RAM_MB} MB
+  CPU:      ${VM_CPU} cores
+  Disk:     ${VM_DISK_GB} GB virtual qcow2
+  SSH:      host TCP ${VM_SSH_PORT} -> guest TCP 22
+  App:      host TCP ${VM_APP_PORT} -> guest TCP 8080
+EOF
+    confirm 'Create this local VPS?' || { unset VM_PASSWORD; return 0; }
+
+    vm_download_base_image
+    install -d -m 0700 "$VM_ROOT/$VM_NAME"
+    qemu-img create -f qcow2 -F qcow2 -b "$VM_BASE_IMAGE" "$(vm_disk_path "$VM_NAME")" "${VM_DISK_GB}G"
+    vm_write_cloud_init "$VM_PASSWORD"
+    unset VM_PASSWORD
+    vm_write_config
+    systemctl enable "spacycloud-vm@${VM_NAME}.service" >/dev/null
+    ok "VPS '${VM_NAME}' was created. It is currently stopped."
+    vm_manage "$VM_NAME"
+}
+
+vm_state() {
+    local name="$1"
+    systemctl is-active "spacycloud-vm@${name}.service" 2>/dev/null || true
+}
+
+vm_start() {
+    local name="$1"
+    systemctl start "spacycloud-vm@${name}.service"
+    sleep 2
+    systemctl is-active --quiet "spacycloud-vm@${name}.service" \
+        || { journalctl -u "spacycloud-vm@${name}.service" --no-pager -n 80; die 'VM did not start.'; }
+    ok "VM '${name}' is booting. Cloud-init can take 1-3 minutes on first boot."
+    say "SSH: ssh -p ${VM_SSH_PORT} ${VM_USERNAME}@HOST_IP"
+    say "Guest application forward: HOST_IP:${VM_APP_PORT} -> guest :8080"
+}
+
+vm_stop() {
+    local name="$1"
+    systemctl stop "spacycloud-vm@${name}.service"
+    ok "VM '${name}' stopped."
+}
+
+vm_edit_configuration() {
+    local name="$1" choice default
+    vm_load_config "$name"
+    if systemctl is-active --quiet "spacycloud-vm@${name}.service"; then
+        warn 'Stop the VM before changing CPU, RAM, or host ports.'
+        return 0
+    fi
+    line
+    printf '%b%s%b\n' "$C_BOLD" "  EDIT VPS CONFIGURATION — ${name}" "$C_RESET"
+    line
+    cat <<EOF
+  [1] Change RAM          (current: ${VM_RAM_MB} MB)
+  [2] Change CPU cores    (current: ${VM_CPU})
+  [3] Change SSH port     (current: ${VM_SSH_PORT})
+  [4] Change app port     (current: ${VM_APP_PORT} -> guest :8080)
+  [0] Back
+EOF
+    read -r -p 'Select setting: ' choice
+    case "$choice" in
+        1)
+            prompt VM_RAM_MB 'New RAM in MB' "$VM_RAM_MB"
+            validate_number "$VM_RAM_MB" 'RAM' 512
+            ;;
+        2)
+            prompt VM_CPU 'New CPU cores' "$VM_CPU"
+            validate_number "$VM_CPU" 'CPU cores' 1
+            ;;
+        3)
+            default="$VM_SSH_PORT"
+            vm_prompt_free_port VM_SSH_PORT 'New host SSH port' "$default"
+            [[ "$VM_SSH_PORT" != "$VM_APP_PORT" ]] || die 'SSH and application ports must be different.'
+            ;;
+        4)
+            default="$VM_APP_PORT"
+            vm_prompt_free_port VM_APP_PORT 'New host application port' "$default"
+            [[ "$VM_SSH_PORT" != "$VM_APP_PORT" ]] || die 'SSH and application ports must be different.'
+            ;;
+        0|'') return 0 ;;
+        *) warn 'Invalid setting.'; return 0 ;;
+    esac
+    vm_write_config
+    ok 'VPS configuration saved. Start the VM to apply it.'
+}
+
+vm_delete() {
+    local name="$1"
+    confirm "Permanently delete VPS '${name}' and its virtual disk?" || return 0
+    systemctl disable --now "spacycloud-vm@${name}.service" >/dev/null 2>&1 || true
+    rm -f "$(vm_config_path "$name")"
+    rm -rf "$VM_ROOT/$name"
+    ok "VPS '${name}' was deleted. Cached base images were preserved."
+}
+
+vm_manage() {
+    local name="$1" choice state
+    vm_validate_name "$name"
+    [[ -f "$(vm_config_path "$name")" ]] || { warn "VPS '${name}' does not exist."; return 0; }
+
+    while true; do
+        vm_load_config "$name"
+        state=$(vm_state "$name")
+        line
+        printf '%b%s%b\n' "$C_BOLD" "  VPS MANAGER — ${VM_NAME}" "$C_RESET"
+        line
+        printf '  User     : %s\n' "$VM_USERNAME"
+        printf '  OS       : %s\n' "$VM_OS_LABEL"
+        printf '  Hostname : %s\n' "$VM_HOSTNAME"
+        printf '  Status   : %s\n' "${state:-inactive}"
+        printf '  Resources: %s MB RAM | %s CPU cores | %s GB disk\n' "$VM_RAM_MB" "$VM_CPU" "$VM_DISK_GB"
+        printf '  Ports    : SSH %s -> 22 | App %s -> 8080\n\n' "$VM_SSH_PORT" "$VM_APP_PORT"
+        cat <<'EOF'
+  [1] Start VM
+  [2] Stop VM
+  [3] Restart VM
+  [4] Edit configuration
+  [5] View boot/service logs
+  [6] Delete VPS
+  [0] Back
+EOF
+        read -r -p 'Select VPS action: ' choice
+        case "$choice" in
+            1) vm_start "$name" ;;
+            2) vm_stop "$name" ;;
+            3) vm_stop "$name"; vm_start "$name" ;;
+            4) vm_edit_configuration "$name" ;;
+            5) journalctl -u "spacycloud-vm@${name}.service" --no-pager -n 120 || true ;;
+            6) vm_delete "$name"; return 0 ;;
+            0|'') return 0 ;;
+            *) warn 'Invalid VPS action.' ;;
+        esac
+    done
+}
+
+vm_list() {
+    local config name state
+    shopt -s nullglob
+    local configs=("$VM_CONFIG_DIR"/*.env)
+    shopt -u nullglob
+    if [[ ${#configs[@]} -eq 0 ]]; then
+        warn 'No local VPS exists yet.'
+        return 0
+    fi
+    printf '%-14s %-14s %-28s %-10s %-8s %-8s %-9s %-9s\n' 'USER' 'NAME' 'OS' 'STATE' 'RAM' 'CPU' 'SSH' 'APP'
+    line
+    for config in "${configs[@]}"; do
+        name=$(basename "$config" .env)
+        vm_load_config "$name"
+        state=$(vm_state "$name")
+        printf '%-14s %-14s %-28s %-10s %-8s %-8s %-9s %-9s\n' \
+            "$VM_USERNAME" "$VM_NAME" "$VM_OS_LABEL" "${state:-inactive}" \
+            "${VM_RAM_MB}M" "$VM_CPU" "$VM_SSH_PORT" "$VM_APP_PORT"
+    done
+}
+
+vps_menu() {
+    require_systemd
+    while true; do
+        line
+        printf '%b%s%b\n' "$C_BOLD" '  [6] LOCAL VPS MANAGER' "$C_RESET"
+        line
+        cat <<'EOF'
+  [1] Create VPS
+  [2] List VPS instances
+  [3] Manage existing VPS
+  [0] Back
+EOF
+        local choice name
+        read -r -p 'Select VPS option: ' choice
+        case "$choice" in
+            1) vm_create ;;
+            2) vm_list ;;
+            3)
+                vm_list
+                read -r -p 'Enter VPS name to manage: ' name
+                [[ -n "$name" ]] && vm_manage "$name"
+                ;;
+            0|'') return 0 ;;
+            *) warn 'Invalid VPS selection.' ;;
+        esac
+    done
+}
+
 print_menu() {
     clear 2>/dev/null || true
     printf '%b\n' "${C_CYAN}"
@@ -1022,13 +1408,14 @@ print_menu() {
     /_/
 EOF
     printf '%b\n' "$C_RESET"
-    printf 'Pterodactyl Panel • Wings • Cloudflare Tunnel • Theme Manager\n\n'
+    printf 'Pterodactyl Panel • Wings • Cloudflare Tunnel • Local VPS Manager\n\n'
     cat <<'EOF'
   [1] Install | Panel
   [2] Install | QDNA Wings
   [3] Install | Cloudflare Tunnel
   [4] Install | Theme
   [5] Health & Status
+  [6] VPS Manager
   [0] Exit
 EOF
     echo
@@ -1045,6 +1432,7 @@ interactive_menu() {
             3) configure_cloudflare ;;
             4) theme_menu ;;
             5) show_status ;;
+            6) vps_menu ;;
             0|'') say 'Goodbye.'; return 0 ;;
             *) warn 'Choose a number from the menu.' ;;
         esac
@@ -1079,6 +1467,7 @@ main() {
         --cloudflare) configure_cloudflare ;;
         --theme) theme_menu ;;
         --status) show_status ;;
+        --vps) vps_menu ;;
         *) usage; die "Unknown option: $1" ;;
     esac
 }
