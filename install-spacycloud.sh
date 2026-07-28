@@ -66,17 +66,17 @@ Interactive mode (recommended):
   sudo bash install-spacycloud.sh
 
 The menu provides independent operations:
-  1) Install/repair Pterodactyl Panel
-  2) Install/configure QDNA Wings node
-  3) Install/connect Cloudflare Tunnel
-  4) Install or change a theme
+  1) Install | Panel (install, update, user creation, domain change)
+  2) Install | QDNA Wings node
+  3) Install | Cloudflare Tunnel connector
+  4) Install | Theme
   5) View health/status
 
 Options:
-  --panel       Run only Panel setup.
+  --panel       Open only the Panel submenu.
   --wings       Run only Wings setup.
-  --cloudflare  Run only cloudflared connector setup.
-  --theme       Open theme installer only.
+  --cloudflare  Run only Cloudflare connector setup.
+  --theme       Open only the theme installer.
   --status      Show diagnostics only.
   --help        Show this help.
 
@@ -155,6 +155,33 @@ prompt_secret() {
     printf '\n'
     printf -v "$variable" '%s' "$input"
     [[ -n "$input" ]] || die "${text} is required."
+}
+
+prompt_cloudflare_token_visible() {
+    # Requested visible-input mode. This does not log stdin, but anyone able to
+    # see the terminal can see the token. It also accepts a pasted full command.
+    local raw extracted
+    warn 'Visible token input is enabled as requested. Do not screen-share this step.'
+    read -r -p 'Cloudflare connector token (or full cloudflared service install command): ' raw
+    extracted=$(printf '%s' "$raw" | grep -oE 'eyJ[A-Za-z0-9_-]+' | tail -n 1 || true)
+    [[ -n "$extracted" ]] || die 'No Cloudflare connector token was detected. Copy a fresh token from Cloudflare Zero Trust → Tunnels → Add a connector.'
+
+    # Catch whitespace/markup/copy errors locally before calling cloudflared.
+    if ! python3 - "$extracted" <<'PY'
+import base64, json, sys
+value = sys.argv[1]
+try:
+    value += '=' * (-len(value) % 4)
+    data = json.loads(base64.urlsafe_b64decode(value).decode('utf-8'))
+    assert all(key in data for key in ('a', 't', 's'))
+except Exception:
+    raise SystemExit(1)
+PY
+    then
+        die 'The pasted value is not a valid Cloudflare connector-token format. Generate a fresh token and paste it without quotes or Markdown.'
+    fi
+    CF_TUNNEL_TOKEN="$extracted"
+    unset raw extracted
 }
 
 confirm() {
@@ -363,25 +390,28 @@ start_panel_stack() {
         || { docker compose -f "$COMPOSE_FILE" logs --tail=120 panel; die 'Panel did not become healthy on 127.0.0.1:3000.'; }
 }
 
-create_panel_admin() {
-    local email="$1" username="$2" password="$3" exists
+create_panel_user() {
+    # email username password admin_flag (1 = administrator, 0 = normal client user)
+    local email="$1" username="$2" password="$3" admin_flag="$4" exists role
     exists=$(docker compose -f "$COMPOSE_FILE" exec -T -e SPACY_ADMIN_EMAIL="$email" panel \
         php artisan tinker --execute='echo \Pterodactyl\Models\User::where("email", getenv("SPACY_ADMIN_EMAIL"))->exists() ? "yes" : "no";' \
         2>/dev/null | tr -d '\r\n' || true)
 
     if [[ "$exists" == 'yes' ]]; then
-        warn "Administrator ${email} already exists. Its password was not modified."
+        warn "A user with ${email} already exists. Its password was not modified."
         return
     fi
 
-    say 'Creating the Panel administrator...'
+    [[ "$admin_flag" == '1' ]] && role='administrator' || role='client user'
+    say "Creating Panel ${role}..."
     docker compose -f "$COMPOSE_FILE" exec -T \
         -e SPACY_ADMIN_EMAIL="$email" \
         -e SPACY_ADMIN_USERNAME="$username" \
         -e SPACY_ADMIN_PASSWORD="$password" \
-        panel sh -lc 'php artisan p:user:make --email="$SPACY_ADMIN_EMAIL" --username="$SPACY_ADMIN_USERNAME" --name-first="Spacy" --name-last="Admin" --password="$SPACY_ADMIN_PASSWORD" --admin=1' \
+        -e SPACY_ADMIN_FLAG="$admin_flag" \
+        panel sh -lc 'php artisan p:user:make --email="$SPACY_ADMIN_EMAIL" --username="$SPACY_ADMIN_USERNAME" --name-first="Spacy" --name-last="User" --password="$SPACY_ADMIN_PASSWORD" --admin="$SPACY_ADMIN_FLAG"' \
         >/dev/null
-    ok 'Panel administrator created.'
+    ok "Panel ${role} created."
 }
 
 install_panel() {
@@ -415,11 +445,158 @@ install_panel() {
     write_panel_stack "$panel_image"
     save_state
     start_panel_stack
-    create_panel_admin "$admin_email" "$admin_username" "$admin_password"
+    create_panel_user "$admin_email" "$admin_username" "$admin_password" 1
     unset admin_password
 
     ok "Panel is ready locally at http://127.0.0.1:3000 and configured for https://${PANEL_DOMAIN}."
     warn 'It becomes public only after option 3 connects the Cloudflare Tunnel and its Public Hostname route is configured.'
+}
+
+backup_panel_database() {
+    require_panel
+    local backup_dir backup_file
+    backup_dir='/root/spacycloud-backups'
+    backup_file="${backup_dir}/panel-$(date +%Y%m%d_%H%M%S).sql.gz"
+    install -d -m 0700 "$backup_dir"
+    set -a
+    # shellcheck disable=SC1090
+    . "$PANEL_ENV"
+    set +a
+    say "Creating Panel database backup: ${backup_file}"
+    docker compose -f "$COMPOSE_FILE" exec -T -e MYSQL_PWD="$ROOT_PASS" database \
+        mariadb-dump -uroot --single-transaction --routines --events panel | gzip -1 > "$backup_file"
+    [[ -s "$backup_file" ]] || die 'Database backup is empty; update cancelled.'
+    ok 'Panel database backup created.'
+}
+
+fetch_panel_versions() {
+    # GitHub provides the official Panel release catalogue. We request several
+    # pages so the menu is not limited to the newest 30 releases.
+    local page body
+    for page in 1 2 3 4; do
+        body=$(curl -fsSL --connect-timeout 12 --max-time 30 \
+            "https://api.github.com/repos/pterodactyl/panel/releases?per_page=100&page=${page}" || true)
+        [[ -n "$body" && "$body" != '[]' ]] || break
+        jq -r '.[] | select(.draft == false and .prerelease == false) | .tag_name' <<<"$body" || true
+    done | awk 'NF && !seen[$0]++' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true
+}
+
+update_panel() {
+    line
+    printf '%b%s%b\n' "$C_BOLD" '  PANEL UPDATE — OFFICIAL RELEASE CATALOGUE' "$C_RESET"
+    line
+    require_panel
+    ensure_docker
+
+    local current versions selected_number selected_version
+    current=$(get_panel_image)
+    say "Current Panel image: ${current}"
+    say 'Fetching official stable Pterodactyl Panel releases...'
+    mapfile -t versions < <(fetch_panel_versions)
+    [[ ${#versions[@]} -gt 0 ]] || die 'Could not fetch the official Panel release list. Check VPS internet access and try again.'
+
+    echo
+    printf '%-5s %s\n' 'No.' 'Pterodactyl Panel version'
+    line
+    local i
+    for i in "${!versions[@]}"; do
+        printf '%-5s %s\n' "$((i + 1))" "${versions[$i]}"
+    done
+    echo
+    read -r -p 'Enter release number (0 to cancel): ' selected_number
+    [[ "$selected_number" == '0' || -z "$selected_number" ]] && return 0
+    [[ "$selected_number" =~ ^[0-9]+$ && "$selected_number" -ge 1 && "$selected_number" -le "${#versions[@]}" ]] \
+        || die 'Invalid release number.'
+    selected_version="${versions[$((selected_number - 1))]}"
+
+    if [[ "$current" == spacycloud/* ]]; then
+        warn 'A local custom theme image is currently active.'
+        warn "Updating switches to the official ${selected_version} Panel image. Reinstall/rebuild your compatible theme through menu 4 afterward."
+    fi
+    confirm "Back up the database and update Panel to ${selected_version}?" || return 0
+    backup_panel_database
+
+    set_panel_image "ghcr.io/pterodactyl/panel:${selected_version}"
+    docker compose -f "$COMPOSE_FILE" pull database cache panel
+    docker compose -f "$COMPOSE_FILE" up -d
+    wait_http 'http://127.0.0.1:3000/' "Panel ${selected_version} local origin" 100 \
+        || { docker compose -f "$COMPOSE_FILE" logs --tail=160 panel; die 'Updated Panel did not become healthy.'; }
+    ok "Panel updated to ${selected_version}."
+}
+
+panel_create_user() {
+    line
+    printf '%b%s%b\n' "$C_BOLD" '  PANEL USER CREATOR' "$C_RESET"
+    line
+    require_panel
+    local email username password admin_choice admin_flag
+    prompt_required email 'User email'
+    [[ "$email" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]] || die 'User email is invalid.'
+    prompt username 'Username' 'user'
+    validate_username "$username"
+    prompt_secret password 'User password (minimum 12 characters)'
+    validate_password "$password"
+    read -r -p 'Make this user a Panel administrator? [y/N]: ' admin_choice
+    [[ "${admin_choice,,}" == 'y' || "${admin_choice,,}" == 'yes' ]] && admin_flag=1 || admin_flag=0
+    confirm "Create ${username} (${email})?" || { unset password; return 0; }
+    create_panel_user "$email" "$username" "$password" "$admin_flag"
+    unset password
+}
+
+panel_change_domain() {
+    line
+    printf '%b%s%b\n' "$C_BOLD" '  PANEL DOMAIN CHANGE' "$C_RESET"
+    line
+    require_panel
+    load_state
+    local previous="$PANEL_DOMAIN"
+    prompt_required PANEL_DOMAIN 'New Panel public domain'
+    PANEL_DOMAIN="${PANEL_DOMAIN,,}"
+    validate_domain "$PANEL_DOMAIN" 'Panel domain'
+    [[ "$PANEL_DOMAIN" != "$previous" ]] || { warn 'The Panel domain is unchanged.'; return 0; }
+    confirm "Change Panel domain from ${previous:-unset} to ${PANEL_DOMAIN}?" || { PANEL_DOMAIN="$previous"; return 0; }
+
+    local image
+    image=$(get_panel_image)
+    write_panel_stack "$image"
+    # Keep the existing local Wings configuration aligned with the new Panel APP_URL.
+    if [[ -f "$WINGS_CONFIG" ]]; then
+        sed -i "s#^remote:.*#remote: 'https://${PANEL_DOMAIN}'#" "$WINGS_CONFIG"
+        systemctl restart wings || warn 'Wings restart failed; check: systemctl status wings'
+    fi
+    docker compose -f "$COMPOSE_FILE" up -d --no-deps --force-recreate panel
+    wait_http 'http://127.0.0.1:3000/' 'Panel local origin after domain change' 60 \
+        || die 'Panel did not become healthy after the domain change.'
+    save_state
+    ok 'Panel domain was updated locally.'
+    warn "Update the Cloudflare Public Hostname so ${PANEL_DOMAIN} maps to http://localhost:3000, then run menu 3/5 to test it."
+}
+
+panel_menu() {
+    while true; do
+        line
+        printf '%b%s%b\n' "$C_BOLD" '  [1] INSTALL | PANEL' "$C_RESET"
+        line
+        cat <<'EOF'
+  [1] Install / Repair Panel
+  [2] Update Panel — list official versions
+  [3] Create Panel user / administrator
+  [4] Change Panel domain
+  [5] Panel status
+  [0] Back
+EOF
+        local choice
+        read -r -p 'Select Panel option: ' choice
+        case "$choice" in
+            1) install_panel ;;
+            2) update_panel ;;
+            3) panel_create_user ;;
+            4) panel_change_domain ;;
+            5) show_status ;;
+            0|'') return 0 ;;
+            *) warn 'Invalid Panel selection.' ;;
+        esac
+    done
 }
 
 choose_wings_subnet() {
@@ -642,7 +819,7 @@ Configure these Public Hostnames in Cloudflare Zero Trust BEFORE continuing:
 Paste only the long connector token, not the entire 'cloudflared service install ...' command.
 EOF
     local CF_TUNNEL_TOKEN
-    prompt_secret CF_TUNNEL_TOKEN 'Cloudflare Tunnel connector token'
+    prompt_cloudflare_token_visible
     confirm 'Install this connector token as the cloudflared system service?' || { unset CF_TUNNEL_TOKEN; return 0; }
 
     if systemctl is-active --quiet cloudflared || systemctl is-enabled --quiet cloudflared 2>/dev/null; then
@@ -651,8 +828,15 @@ EOF
         cloudflared service uninstall || true
     fi
 
-    # cloudflared validates this token and creates a root-owned systemd service.
-    cloudflared service install "$CF_TUNNEL_TOKEN"
+    # cloudflared performs the final online token validation and creates a
+    # root-owned systemd service. A structurally-valid token can still be stale,
+    # revoked, or from a deleted tunnel, so handle that cleanly and return to menu.
+    if ! cloudflared service install "$CF_TUNNEL_TOKEN"; then
+        unset CF_TUNNEL_TOKEN
+        warn 'Cloudflare rejected this connector token. Generate a fresh token from the active tunnel and paste it again.'
+        warn 'Do not reuse the token that was pasted into chat or exposed on screen.'
+        return 0
+    fi
     unset CF_TUNNEL_TOKEN
     systemctl daemon-reload
     systemctl enable --now cloudflared
@@ -840,10 +1024,10 @@ EOF
     printf '%b\n' "$C_RESET"
     printf 'Pterodactyl Panel • Wings • Cloudflare Tunnel • Theme Manager\n\n'
     cat <<'EOF'
-  [1] Install / Repair Panel
-  [2] Install / Configure QDNA Wings
-  [3] Install / Connect Cloudflare Tunnel
-  [4] Theme Installer
+  [1] Install | Panel
+  [2] Install | QDNA Wings
+  [3] Install | Cloudflare Tunnel
+  [4] Install | Theme
   [5] Health & Status
   [0] Exit
 EOF
@@ -856,7 +1040,7 @@ interactive_menu() {
         print_menu
         read -r -p 'Select an option: ' choice
         case "$choice" in
-            1) install_panel ;;
+            1) panel_menu ;;
             2) install_wings ;;
             3) configure_cloudflare ;;
             4) theme_menu ;;
@@ -890,7 +1074,7 @@ main() {
     install_self_command
     case "${1:-}" in
         '') interactive_menu ;;
-        --panel) install_panel ;;
+        --panel) panel_menu ;;
         --wings) install_wings ;;
         --cloudflare) configure_cloudflare ;;
         --theme) theme_menu ;;
