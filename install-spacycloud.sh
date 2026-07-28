@@ -95,7 +95,15 @@ require_root() {
 }
 
 require_systemd() {
-    [[ -d /run/systemd/system ]] || die 'This operation needs a normal systemd VPS (not a Codespace/container).'
+    # Wings, cloudflared service management, and QEMU VPS instances need a real
+    # host init system. Treat a Codespace/container as an unsupported runtime,
+    # but return cleanly to the menu instead of terminating the whole script.
+    if [[ ! -d /run/systemd/system ]] || ! systemctl show-environment >/dev/null 2>&1; then
+        printf '%b%s%b\n' "$C_YELLOW" '[SpacyCloud] This feature needs a real VPS with systemd. Current workspace/container mode cannot run Wings, systemd services, or QEMU/KVM VMs.' "$C_RESET"
+        printf '%b%s%b\n' "$C_BLUE" '[SpacyCloud] No installation was changed. Upload/commit this script from Codespaces, then run it on your actual VPS.' "$C_RESET"
+        return 1
+    fi
+    return 0
 }
 
 command_exists() { command -v "$1" >/dev/null 2>&1; }
@@ -219,7 +227,7 @@ ensure_common_packages() {
 }
 
 ensure_docker() {
-    require_systemd
+    require_systemd || return 1
     if command_exists docker && docker info >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
         ok 'Docker Engine and Docker Compose plugin are ready.'
         return
@@ -420,11 +428,11 @@ create_panel_user() {
 }
 
 install_panel() {
-    require_systemd
+    require_systemd || return 0
     line
     printf '%b%s%b\n' "$C_BOLD" '  [1] PTERODACTYL PANEL INSTALL / REPAIR' "$C_RESET"
     line
-    ensure_docker
+    ensure_docker || return 0
     load_state
 
     prompt_required PANEL_DOMAIN 'Panel public domain (example: games.example.com)'
@@ -491,7 +499,7 @@ update_panel() {
     printf '%b%s%b\n' "$C_BOLD" '  PANEL UPDATE — OFFICIAL RELEASE CATALOGUE' "$C_RESET"
     line
     require_panel
-    ensure_docker
+    ensure_docker || return 0
 
     local current versions selected_number selected_version
     current=$(get_panel_image)
@@ -760,11 +768,11 @@ EOF
 }
 
 install_wings() {
-    require_systemd
+    require_systemd || return 0
     line
     printf '%b%s%b\n' "$C_BOLD" '  [2] QDNA WINGS INSTALL / CONFIGURE' "$C_RESET"
     line
-    ensure_docker
+    ensure_docker || return 0
     load_state
     require_panel
 
@@ -829,7 +837,7 @@ configure_cloudflare() {
     # Deliberately minimal by request: option 3 installs cloudflared when absent,
     # accepts one connector-token paste, and connects. Hostnames/routes are not
     # prompted for or modified here; they remain configured in Cloudflare.
-    require_systemd
+    require_systemd || return 0
     line
     printf '%b%s%b\n' "$C_BOLD" '  [3] INSTALL | CLOUDFLARE TUNNEL' "$C_RESET"
     line
@@ -947,7 +955,7 @@ vm_port_is_free() {
 }
 
 vm_require_dependencies() {
-    require_systemd
+    require_systemd || return 1
     [[ "$(dpkg --print-architecture)" == 'amd64' ]] \
         || die 'The VPS Manager currently supports amd64 hosts because its official cloud images are amd64.'
 
@@ -1175,7 +1183,7 @@ vm_create() {
     line
     printf '%b%s%b\n' "$C_BOLD" '  CREATE LOCAL VPS' "$C_RESET"
     line
-    vm_require_dependencies
+    vm_require_dependencies || return 0
     vm_select_os || return 0
 
     local VM_PASSWORD available_ram free_gb
@@ -1369,7 +1377,7 @@ vm_list() {
 }
 
 vps_menu() {
-    require_systemd
+    require_systemd || return 0
     while true; do
         line
         printf '%b%s%b\n' "$C_BOLD" '  [6] LOCAL VPS MANAGER' "$C_RESET"
