@@ -94,11 +94,15 @@ require_root() {
     [[ "$EUID" -eq 0 ]] || die 'Run as root: sudo bash install-spacycloud.sh'
 }
 
+has_real_systemd() {
+    [[ -d /run/systemd/system ]] && systemctl show-environment >/dev/null 2>&1
+}
+
 require_systemd() {
     # Wings, cloudflared service management, and QEMU VPS instances need a real
     # host init system. Treat a Codespace/container as an unsupported runtime,
     # but return cleanly to the menu instead of terminating the whole script.
-    if [[ ! -d /run/systemd/system ]] || ! systemctl show-environment >/dev/null 2>&1; then
+    if ! has_real_systemd; then
         printf '%b%s%b\n' "$C_YELLOW" '[SpacyCloud] This feature needs a real VPS with systemd. Current workspace/container mode cannot run Wings, systemd services, or QEMU/KVM VMs.' "$C_RESET"
         printf '%b%s%b\n' "$C_BLUE" '[SpacyCloud] No installation was changed. Upload/commit this script from Codespaces, then run it on your actual VPS.' "$C_RESET"
         return 1
@@ -1416,7 +1420,12 @@ print_menu() {
     /_/
 EOF
     printf '%b\n' "$C_RESET"
-    printf 'Pterodactyl Panel • Wings • Cloudflare Tunnel • Local VPS Manager\n\n'
+    printf 'Pterodactyl Panel • Wings • Cloudflare Tunnel • Local VPS Manager\n'
+    if has_real_systemd; then
+        printf '%b%s%b\n\n' "$C_GREEN" '● VPS MODE — systemd services available' "$C_RESET"
+    else
+        printf '%b%s%b\n\n' "$C_YELLOW" '● DEVELOPER WORKSPACE MODE — upload/test UI here; run Panel, Wings, Cloudflare and VPS actions on a real VPS' "$C_RESET"
+    fi
     cat <<'EOF'
   [1] Install | Panel
   [2] Install | QDNA Wings
