@@ -966,8 +966,8 @@ vm_require_dependencies() {
     say 'Checking QEMU/KVM and cloud-image dependencies...'
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -y
-    # Includes the exact requested packages plus qemu-utils for qemu-img.
-    apt-get install -y qemu-system qemu-utils cloud-image-utils wget lsof
+    # Includes the requested packages plus qemu-utils and socat for disk and live-console management.
+    apt-get install -y qemu-system qemu-utils cloud-image-utils wget lsof socat
 
     install -d -m 0700 "$VM_CONFIG_DIR"
     install -d -m 0755 "$VM_ROOT/images"
@@ -1005,17 +1005,26 @@ else
     accel_args=(-accel tcg -cpu max)
 fi
 
+# QEMU exposes guest ttyS0 on a local Unix socket. SpacyCloud attaches the
+# invoking terminal with socat so boot messages and the guest login prompt are
+# interactive without stopping the VM when the terminal disconnects.
+console_socket="${root}/console.sock"
+rm -f "$console_socket"
+
 exec /usr/bin/qemu-system-x86_64 \
     -name "$VM_NAME" \
     "${accel_args[@]}" \
     -machine q35 \
     -m "${VM_RAM_MB}M" \
     -smp "$VM_CPU" \
+    -boot order=c \
     -drive "file=${root}/disk.qcow2,if=virtio,format=qcow2,cache=none" \
     -drive "file=${root}/seed.iso,if=virtio,format=raw,readonly=on" \
     -nic "user,model=virtio-net-pci,hostfwd=tcp::${VM_SSH_PORT}-:22,hostfwd=tcp::${VM_APP_PORT}-:8080" \
     -display none \
-    -serial mon:stdio \
+    -monitor none \
+    -chardev "socket,id=serial0,path=${console_socket},server=on,wait=off" \
+    -serial chardev:serial0 \
     -no-reboot
 EOF
     chmod 0755 "$VM_RUNNER"
@@ -1095,6 +1104,8 @@ ssh_pwauth: true
 package_update: true
 packages:
   - qemu-guest-agent
+runcmd:
+  - [ systemctl, enable, --now, serial-getty@ttyS0.service ]
 EOF
     cat > "$vm_dir/meta-data" <<EOF
 instance-id: spacycloud-${VM_NAME}
@@ -1284,11 +1295,45 @@ vm_state() {
     fi
 }
 
+vm_console_socket() { printf '%s/%s/console.sock' "$VM_ROOT" "$1"; }
+
+vm_attach_console() {
+    local name="$1" socket i
+    vm_load_config "$name"
+    if ! vm_is_running "$name"; then
+        warn "VM '${name}' is not running. Select Start VM first."
+        return 0
+    fi
+    socket=$(vm_console_socket "$name")
+    for ((i=0; i<30; i++)); do
+        [[ -S "$socket" ]] && break
+        sleep 1
+    done
+    [[ -S "$socket" ]] || { warn 'The QEMU serial console socket did not become available. Check VM logs.'; return 0; }
+
+    line
+    printf '%b%s%b\n' "$C_BOLD" "  LIVE VM CONSOLE — ${VM_NAME}" "$C_RESET"
+    line
+    cat <<EOF
+  Boot output and the guest login screen are shown below.
+  Login user : ${VM_USERNAME}
+  SSH port   : ${VM_SSH_PORT}
+
+  To leave this live console and keep the VM running, press Ctrl+].
+EOF
+    echo
+    # escape=0x1d is Ctrl+] and closes only socat, not the guest VM.
+    socat STDIO,raw,echo=0,escape=0x1d "UNIX-CONNECT:${socket}" || true
+    printf '\n'
+    ok 'Detached from live console. The VM remains running.'
+}
+
 vm_start() {
     local name="$1" pid_file log_file pid
     vm_load_config "$name"
     if vm_is_running "$name"; then
-        warn "VM '${name}' is already running."
+        warn "VM '${name}' is already running. Opening its live console."
+        vm_attach_console "$name"
         return 0
     fi
 
@@ -1320,6 +1365,7 @@ vm_start() {
     ok "VM '${name}' is booting. Cloud-init can take 1-3 minutes on first boot."
     say "SSH: ssh -p ${VM_SSH_PORT} ${VM_USERNAME}@HOST_IP"
     say "Guest application forward: HOST_IP:${VM_APP_PORT} -> guest :8080"
+    vm_attach_console "$name"
 }
 
 vm_stop() {
@@ -1341,6 +1387,7 @@ vm_stop() {
         fi
         rm -f "$pid_file"
     fi
+    rm -f "$(vm_console_socket "$name")"
     ok "VM '${name}' stopped."
 }
 
@@ -1425,6 +1472,7 @@ vm_manage() {
   [4] Edit configuration
   [5] View boot/service logs
   [6] Delete VPS
+  [7] Open live console
   [0] Back
 EOF
         read -r -p 'Select VPS action: ' choice
@@ -1441,6 +1489,7 @@ EOF
                 fi
                 ;;
             6) vm_delete "$name"; return 0 ;;
+            7) vm_attach_console "$name" ;;
             0|'') return 0 ;;
             *) warn 'Invalid VPS action.' ;;
         esac
