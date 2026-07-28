@@ -99,12 +99,11 @@ has_real_systemd() {
 }
 
 require_systemd() {
-    # Wings, cloudflared service management, and QEMU VPS instances need a real
-    # host init system. Treat a Codespace/container as an unsupported runtime,
-    # but return cleanly to the menu instead of terminating the whole script.
+    # Wings and cloudflared service management need a real host init system.
+    # The local VPS manager has a no-systemd QEMU workspace mode.
     if ! has_real_systemd; then
-        printf '%b%s%b\n' "$C_YELLOW" '[SpacyCloud] This feature needs a real VPS with systemd. Current workspace/container mode cannot run Wings, systemd services, or QEMU/KVM VMs.' "$C_RESET"
-        printf '%b%s%b\n' "$C_BLUE" '[SpacyCloud] No installation was changed. Upload/commit this script from Codespaces, then run it on your actual VPS.' "$C_RESET"
+        printf '%b%s%b\n' "$C_YELLOW" '[SpacyCloud] This feature needs a real VPS with systemd. Current workspace/container mode cannot run Wings or systemd services.' "$C_RESET"
+        printf '%b%s%b\n' "$C_BLUE" '[SpacyCloud] No installation was changed. Upload/commit this script from Codespaces, then run Panel/Wings/Cloudflare on your actual VPS.' "$C_RESET"
         return 1
     fi
     return 0
@@ -959,7 +958,8 @@ vm_port_is_free() {
 }
 
 vm_require_dependencies() {
-    require_systemd || return 1
+    # QEMU works in both real VPS mode (systemd) and a root-enabled workspace.
+    # Without /dev/kvm it transparently uses software emulation (TCG).
     [[ "$(dpkg --print-architecture)" == 'amd64' ]] \
         || die 'The VPS Manager currently supports amd64 hosts because its official cloud images are amd64.'
 
@@ -977,7 +977,12 @@ vm_require_dependencies() {
     if [[ -e /dev/kvm ]]; then
         ok 'KVM acceleration is available.'
     else
-        warn 'KVM acceleration is unavailable. VMs will use slow software emulation (TCG). Enable nested virtualization/KVM for normal performance.'
+        warn 'KVM acceleration is unavailable. Workspace VM mode will use slower software emulation (TCG).'
+    fi
+    if has_real_systemd; then
+        ok 'VPS lifecycle mode: systemd service.'
+    else
+        ok 'VPS lifecycle mode: workspace background process (nohup + PID tracking).'
     fi
 }
 
@@ -1036,7 +1041,9 @@ StandardError=journal
 [Install]
 WantedBy=multi-user.target
 EOF
-    systemctl daemon-reload
+    if has_real_systemd; then
+        systemctl daemon-reload
+    fi
 }
 
 vm_load_config() {
@@ -1239,37 +1246,108 @@ EOF
     vm_write_cloud_init "$VM_PASSWORD"
     unset VM_PASSWORD
     vm_write_config
-    systemctl enable "spacycloud-vm@${VM_NAME}.service" >/dev/null
+    if has_real_systemd; then
+        systemctl enable "spacycloud-vm@${VM_NAME}.service" >/dev/null
+    else
+        : > "$VM_ROOT/$VM_NAME/console.log"
+        rm -f "$VM_ROOT/$VM_NAME/qemu.pid"
+    fi
     ok "VPS '${VM_NAME}' was created. It is currently stopped."
     vm_manage "$VM_NAME"
 }
 
+vm_workspace_pid_file() { printf '%s/%s/qemu.pid' "$VM_ROOT" "$1"; }
+
+vm_workspace_running() {
+    local name="$1" pid_file pid
+    pid_file=$(vm_workspace_pid_file "$name")
+    [[ -r "$pid_file" ]] || return 1
+    pid=$(cat "$pid_file" 2>/dev/null || true)
+    [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null
+}
+
+vm_is_running() {
+    local name="$1"
+    if has_real_systemd; then
+        systemctl is-active --quiet "spacycloud-vm@${name}.service"
+    else
+        vm_workspace_running "$name"
+    fi
+}
+
 vm_state() {
     local name="$1"
-    systemctl is-active "spacycloud-vm@${name}.service" 2>/dev/null || true
+    if vm_is_running "$name"; then
+        printf 'active'
+    else
+        printf 'inactive'
+    fi
 }
 
 vm_start() {
-    local name="$1"
-    systemctl start "spacycloud-vm@${name}.service"
-    sleep 2
-    systemctl is-active --quiet "spacycloud-vm@${name}.service" \
-        || { journalctl -u "spacycloud-vm@${name}.service" --no-pager -n 80; die 'VM did not start.'; }
+    local name="$1" pid_file log_file pid
+    vm_load_config "$name"
+    if vm_is_running "$name"; then
+        warn "VM '${name}' is already running."
+        return 0
+    fi
+
+    if has_real_systemd; then
+        systemctl start "spacycloud-vm@${name}.service"
+        sleep 2
+        if ! vm_is_running "$name"; then
+            journalctl -u "spacycloud-vm@${name}.service" --no-pager -n 80 || true
+            warn 'VM did not start. Review the service log above.'
+            return 0
+        fi
+    else
+        # Codespaces/workspace fallback: QEMU is detached with a tracked PID.
+        # It remains a local VM in this workspace, not an external cloud VPS.
+        log_file="$VM_ROOT/$name/console.log"
+        pid_file=$(vm_workspace_pid_file "$name")
+        nohup "$VM_RUNNER" "$name" >> "$log_file" 2>&1 < /dev/null &
+        pid=$!
+        printf '%s\n' "$pid" > "$pid_file"
+        sleep 3
+        if ! kill -0 "$pid" 2>/dev/null; then
+            rm -f "$pid_file"
+            tail -n 80 "$log_file" || true
+            warn 'Workspace QEMU process exited during boot. Review the console log above.'
+            return 0
+        fi
+    fi
+
     ok "VM '${name}' is booting. Cloud-init can take 1-3 minutes on first boot."
     say "SSH: ssh -p ${VM_SSH_PORT} ${VM_USERNAME}@HOST_IP"
     say "Guest application forward: HOST_IP:${VM_APP_PORT} -> guest :8080"
 }
 
 vm_stop() {
-    local name="$1"
-    systemctl stop "spacycloud-vm@${name}.service"
+    local name="$1" pid_file pid i
+    if has_real_systemd; then
+        systemctl stop "spacycloud-vm@${name}.service" || true
+    else
+        pid_file=$(vm_workspace_pid_file "$name")
+        if [[ -r "$pid_file" ]]; then
+            pid=$(cat "$pid_file" 2>/dev/null || true)
+            if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+                kill -TERM "$pid" 2>/dev/null || true
+                for ((i=0; i<10; i++)); do
+                    kill -0 "$pid" 2>/dev/null || break
+                    sleep 1
+                done
+                kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
+            fi
+        fi
+        rm -f "$pid_file"
+    fi
     ok "VM '${name}' stopped."
 }
 
 vm_edit_configuration() {
     local name="$1" choice default
     vm_load_config "$name"
-    if systemctl is-active --quiet "spacycloud-vm@${name}.service"; then
+    if vm_is_running "$name"; then
         warn 'Stop the VM before changing CPU, RAM, or host ports.'
         return 0
     fi
@@ -1313,7 +1391,11 @@ EOF
 vm_delete() {
     local name="$1"
     confirm "Permanently delete VPS '${name}' and its virtual disk?" || return 0
-    systemctl disable --now "spacycloud-vm@${name}.service" >/dev/null 2>&1 || true
+    if has_real_systemd; then
+        systemctl disable --now "spacycloud-vm@${name}.service" >/dev/null 2>&1 || true
+    else
+        vm_stop "$name" >/dev/null 2>&1 || true
+    fi
     rm -f "$(vm_config_path "$name")"
     rm -rf "$VM_ROOT/$name"
     ok "VPS '${name}' was deleted. Cached base images were preserved."
@@ -1351,7 +1433,13 @@ EOF
             2) vm_stop "$name" ;;
             3) vm_stop "$name"; vm_start "$name" ;;
             4) vm_edit_configuration "$name" ;;
-            5) journalctl -u "spacycloud-vm@${name}.service" --no-pager -n 120 || true ;;
+            5)
+                if has_real_systemd; then
+                    journalctl -u "spacycloud-vm@${name}.service" --no-pager -n 120 || true
+                else
+                    tail -n 120 "$VM_ROOT/$name/console.log" 2>/dev/null || warn 'No workspace console log exists yet.'
+                fi
+                ;;
             6) vm_delete "$name"; return 0 ;;
             0|'') return 0 ;;
             *) warn 'Invalid VPS action.' ;;
@@ -1381,7 +1469,7 @@ vm_list() {
 }
 
 vps_menu() {
-    require_systemd || return 0
+    # Supports real VPS mode and Codespaces/workspace QEMU fallback mode.
     while true; do
         line
         printf '%b%s%b\n' "$C_BOLD" '  [6] LOCAL VPS MANAGER' "$C_RESET"
@@ -1424,7 +1512,7 @@ EOF
     if has_real_systemd; then
         printf '%b%s%b\n\n' "$C_GREEN" '● VPS MODE — systemd services available' "$C_RESET"
     else
-        printf '%b%s%b\n\n' "$C_YELLOW" '● DEVELOPER WORKSPACE MODE — upload/test UI here; run Panel, Wings, Cloudflare and VPS actions on a real VPS' "$C_RESET"
+        printf '%b%s%b\n\n' "$C_YELLOW" '● DEVELOPER WORKSPACE MODE — Panel/Wings/Cloudflare need a real VPS; option 6 runs local QEMU VPS mode (TCG if no KVM)' "$C_RESET"
     fi
     cat <<'EOF'
   [1] Install | Panel
