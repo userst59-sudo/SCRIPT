@@ -1116,6 +1116,30 @@ EOF
     unset password password_hash
 }
 
+vm_ensure_serial_console_seed() {
+    # Existing VMs created by older SpacyCloud script revisions did not include
+    # the serial-getty cloud-init directive. Add it once and refresh the NoCloud
+    # seed so a stopped legacy VM can provide an interactive ttyS0 login.
+    local name="$1" vm_dir user_data meta_data
+    vm_dir="$VM_ROOT/$name"
+    user_data="$vm_dir/user-data"
+    meta_data="$vm_dir/meta-data"
+    [[ -f "$user_data" && -f "$meta_data" ]] || return 0
+    grep -Fq 'serial-getty@ttyS0.service' "$user_data" && return 0
+
+    cat >> "$user_data" <<'EOF'
+runcmd:
+  - [ systemctl, enable, --now, serial-getty@ttyS0.service ]
+EOF
+    cat > "$meta_data" <<EOF
+instance-id: spacycloud-${name}-console-$(date +%s)
+local-hostname: ${VM_HOSTNAME}
+EOF
+    cloud-localds "$vm_dir/seed.iso" "$user_data" "$meta_data"
+    chmod 600 "$user_data" "$meta_data" "$vm_dir/seed.iso"
+    ok 'Upgraded this VM seed for interactive serial-console login.'
+}
+
 vm_select_os() {
     line
     printf '%b%s%b\n' "$C_BOLD" '  VPS OPERATING SYSTEM CATALOGUE' "$C_RESET"
@@ -1297,8 +1321,19 @@ vm_state() {
 
 vm_console_socket() { printf '%s/%s/console.sock' "$VM_ROOT" "$1"; }
 
+vm_ensure_console_tools() {
+    if command_exists socat; then
+        return 0
+    fi
+    say 'Installing socat for the live VM terminal...'
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y
+    apt-get install -y socat
+}
+
 vm_attach_console() {
     local name="$1" socket i
+    vm_ensure_console_tools || return 0
     vm_load_config "$name"
     if ! vm_is_running "$name"; then
         warn "VM '${name}' is not running. Select Start VM first."
@@ -1331,7 +1366,16 @@ EOF
 vm_start() {
     local name="$1" pid_file log_file pid
     vm_load_config "$name"
+    vm_ensure_serial_console_seed "$name"
+    # Recreate the runner on every start. This upgrades already-created VMs
+    # from older script revisions to the live serial-console runner.
+    vm_write_runner
+    vm_ensure_console_tools || return 0
     if vm_is_running "$name"; then
+        if [[ ! -S "$(vm_console_socket "$name")" ]]; then
+            warn "VM '${name}' is running from an older runner without a live console socket. Select Restart VM once to upgrade it."
+            return 0
+        fi
         warn "VM '${name}' is already running. Opening its live console."
         vm_attach_console "$name"
         return 0
@@ -1362,9 +1406,8 @@ vm_start() {
         fi
     fi
 
-    ok "VM '${name}' is booting. Cloud-init can take 1-3 minutes on first boot."
-    say "SSH: ssh -p ${VM_SSH_PORT} ${VM_USERNAME}@HOST_IP"
-    say "Guest application forward: HOST_IP:${VM_APP_PORT} -> guest :8080"
+    ok "VM '${name}' QEMU process started. Opening the live boot console now..."
+    say 'You will see BIOS, virtual-disk boot, Linux boot, cloud-init, and the guest login prompt in this terminal.'
     vm_attach_console "$name"
 }
 
